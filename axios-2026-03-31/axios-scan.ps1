@@ -67,25 +67,28 @@ $script:FindingsNetwork   = [System.Collections.Generic.List[string]]::new()
 $script:FindingsCache     = [System.Collections.Generic.List[string]]::new()
 
 # --- Output helpers ----------------------------------------------------------
+function Write-Stderr { param([string]$msg)
+    [Console]::Error.WriteLine($msg)
+}
 function Write-Header { param([string]$msg)
     if (-not $Json) { Write-Host "`n$msg" -ForegroundColor Cyan }
-    else { Write-Host "`n$msg" -ForegroundColor Cyan 2>&1 | Out-Null; Write-Error "`n$msg" }
+    else { Write-Stderr "`n$msg" }
 }
 function Write-Ok     { param([string]$msg)
     $line = "  [OK]  $msg"
-    if ($Json) { Write-Error $line } elseif (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "+" -ForegroundColor Green -NoNewline; Write-Host "  $msg" } else { Write-Host $line }
+    if ($Json) { Write-Stderr $line } elseif (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "+" -ForegroundColor Green -NoNewline; Write-Host "  $msg" } else { Write-Host $line }
 }
 function Write-Warn   { param([string]$msg)
     $line = "  [WARN] $msg"
-    if ($Json) { Write-Error $line } elseif (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "!" -ForegroundColor Yellow -NoNewline; Write-Host "  $msg" } else { Write-Host $line }
+    if ($Json) { Write-Stderr $line } elseif (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "!" -ForegroundColor Yellow -NoNewline; Write-Host "  $msg" } else { Write-Host $line }
 }
 function Write-Danger { param([string]$msg)
     $line = "  [!!!] $msg"
-    if ($Json) { Write-Error $line } elseif (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "X" -ForegroundColor Red -NoNewline; Write-Host "  $msg" -ForegroundColor Red } else { Write-Host $line }
+    if ($Json) { Write-Stderr $line } elseif (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "X" -ForegroundColor Red -NoNewline; Write-Host "  $msg" -ForegroundColor Red } else { Write-Host $line }
 }
 function Write-Info   { param([string]$msg)
     $line = "      $msg"
-    if ($Json) { Write-Error $line } else { Write-Host $line -ForegroundColor DarkGray }
+    if ($Json) { Write-Stderr $line } else { Write-Host $line -ForegroundColor DarkGray }
 }
 
 function Get-SHA256 { param([string]$path)
@@ -98,7 +101,7 @@ function Get-SHA256 { param([string]$path)
 function Scan-Lockfiles {
     Write-Header "Phase 1/4 — Package lockfiles"
 
-    $lockfileNames = @("package-lock.json", "yarn.lock", "pnpm-lock.yaml")
+    $lockfileNames = @("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb")
     $excludeDirs   = @("node_modules", ".git", ".cache")
 
     $lockfiles = Get-ChildItem -Path $ScanDir -Recurse -File -ErrorAction SilentlyContinue |
@@ -120,10 +123,24 @@ function Scan-Lockfiles {
         if (-not $content) { continue }
 
         # --- Compromised axios versions ---
-        if ($content -match '"(node_modules/)?axios"') {
-            $axiosBlock = [regex]::Match($content, '"(node_modules/)?axios"[^{]*\{[^}]+\}')
-            if ($axiosBlock.Success -and $axiosBlock.Value -match '"version"\s*:\s*"(1\.14\.1|0\.30\.4)"') {
-                $badVer = $Matches[1]
+        # Handles package-lock.json (JSON), yarn.lock (key@ver:), pnpm-lock.yaml (YAML)
+        if ($content -match 'axios') {
+            $badVer = $null
+            $lines = $content -split "`n"
+            $inAxios = $false; $linesSince = 0
+            foreach ($line in $lines) {
+                if ($line -match '["/]axios"?\s*[:{]') {
+                    $inAxios = $true; $linesSince = 0
+                }
+                if ($inAxios) {
+                    $linesSince++
+                    if ($line -match '"?version"?\s*[:=]\s*"?(1\.14\.1|0\.30\.4)"?') {
+                        $badVer = $Matches[1]; $inAxios = $false; break
+                    }
+                    if ($linesSince -gt 15) { $inAxios = $false }
+                }
+            }
+            if ($badVer) {
                 Write-Danger "COMPROMISED axios@$badVer in: $($lockfile.FullName)"
                 $script:FindingsPackages.Add("$($lockfile.FullName): axios@$badVer")
                 if ($script:ExitCode -lt 1) { $script:ExitCode = 1 }
@@ -161,10 +178,22 @@ function Scan-Lockfiles {
         }
 
         # --- @qqbrowser/openclaw-qbot@0.0.130 ---
-        if ($content -match 'openclaw-qbot' -and $content -match '"version"\s*:\s*"0\.0\.130"') {
-            Write-Danger "COMPROMISED: @qqbrowser/openclaw-qbot@0.0.130 in: $($lockfile.FullName)"
-            $script:FindingsPackages.Add("$($lockfile.FullName): @qqbrowser/openclaw-qbot@0.0.130")
-            if ($script:ExitCode -lt 2) { $script:ExitCode = 2 }
+        if ($content -match 'openclaw-qbot') {
+            $qbVer = $null
+            $inQbot = $false; $qbLines = 0
+            foreach ($line in ($content -split "`n")) {
+                if ($line -match 'openclaw-qbot') { $inQbot = $true; $qbLines = 0 }
+                if ($inQbot) {
+                    $qbLines++
+                    if ($line -match '"version"\s*:\s*"([^"]+)"') { $qbVer = $Matches[1]; $inQbot = $false; break }
+                    if ($qbLines -gt 15) { $inQbot = $false }
+                }
+            }
+            if ($qbVer -eq "0.0.130") {
+                Write-Danger "COMPROMISED: @qqbrowser/openclaw-qbot@0.0.130 in: $($lockfile.FullName)"
+                $script:FindingsPackages.Add("$($lockfile.FullName): @qqbrowser/openclaw-qbot@0.0.130")
+                if ($script:ExitCode -lt 2) { $script:ExitCode = 2 }
+            }
         }
     }
 
@@ -257,7 +286,7 @@ function Scan-Artifacts {
     $KNOWN_HASHES = @{
         "617b67a8e1210e4fc87c92d1d1da45a2f311c08d26e89b12307cf583c900d101" = "Windows WAVESHAPER.V2"
     }
-    $artifacts = 0
+    $script:artifactsFound = 0
 
     function Check-Artifact {
         param([string]$path, [string]$label, [string]$expectedSha = "")
@@ -280,7 +309,7 @@ function Scan-Artifacts {
             } catch {}
             $script:FindingsArtifacts.Add($path)
             if ($script:ExitCode -lt 2) { $script:ExitCode = 2 }
-            $script:artifacts++
+            $script:artifactsFound++
         }
     }
 
@@ -307,7 +336,7 @@ function Scan-Artifacts {
             Write-Danger "  Value: $($regVal.$regKey)"
             $script:FindingsArtifacts.Add("Registry: $regPath\$regKey = $($regVal.$regKey)")
             if ($script:ExitCode -lt 2) { $script:ExitCode = 2 }
-            $artifacts++
+            $script:artifactsFound++
         }
     } catch {}
 
@@ -320,7 +349,7 @@ function Scan-Artifacts {
             Write-Danger "  Value: $($regValLM.$regKey)"
             $script:FindingsArtifacts.Add("Registry HKLM: $regPathLM\$regKey")
             if ($script:ExitCode -lt 2) { $script:ExitCode = 2 }
-            $artifacts++
+            $script:artifactsFound++
         }
     } catch {}
 
@@ -334,11 +363,12 @@ function Scan-Artifacts {
         foreach ($task in $suspiciousTasks) {
             Write-Warn "SUSPICIOUS scheduled task: $($task.TaskPath)$($task.TaskName)"
             $script:FindingsArtifacts.Add("Scheduled task: $($task.TaskName)")
-            if ($script:ExitCode -lt 1) { $script:ExitCode = [Math]::Max($script:ExitCode, 1) }
+            if ($script:ExitCode -lt 1) { $script:ExitCode = 1 }
+            $script:artifactsFound++
         }
     } catch {}
 
-    if ($artifacts -eq 0 -and $script:FindingsArtifacts.Count -eq 0) {
+    if ($script:artifactsFound -eq 0 -and $script:FindingsArtifacts.Count -eq 0) {
         Write-Ok "No RAT artifacts or persistence found"
     }
 }
@@ -357,13 +387,13 @@ function Scan-Network {
         foreach ($ip in $C2_IPS) {
             $hits = $connections | Where-Object { $_.RemoteAddress -eq $ip }
             foreach ($hit in $hits) {
-                Write-Danger "ACTIVE C2 CONNECTION: $ip:$($hit.RemotePort)"
+                Write-Danger "ACTIVE C2 CONNECTION: ${ip}:$($hit.RemotePort)"
                 Write-Danger "  Local: $($hit.LocalAddress):$($hit.LocalPort)  PID: $($hit.OwningProcess)"
                 try {
                     $proc = Get-Process -Id $hit.OwningProcess -ErrorAction SilentlyContinue
                     if ($proc) { Write-Danger "  Process: $($proc.Name) ($($proc.MainModule.FileName))" }
                 } catch {}
-                $script:FindingsNetwork.Add("Active connection to $ip:$($hit.RemotePort) (PID $($hit.OwningProcess))")
+                $script:FindingsNetwork.Add("Active connection to ${ip}:$($hit.RemotePort) (PID $($hit.OwningProcess))")
                 if ($script:ExitCode -lt 2) { $script:ExitCode = 2 }
                 $networkHits++
             }
@@ -415,13 +445,15 @@ function Scan-Network {
         }
     }
 
-    # --- npm cache ---
-    $npmCachePath = "$env:AppData\npm-cache\_cacache"
-    if (Test-Path $npmCachePath) {
-        $badCache = Get-ChildItem $npmCachePath -Recurse -Filter "*.json" -ErrorAction SilentlyContinue |
+    # --- Package manager caches ---
+    # npm: honour npm_config_cache env var, fall back to default
+    $npmCacheRoot = if ($env:npm_config_cache) { $env:npm_config_cache } else { "$env:AppData\npm-cache" }
+    $npmCacache = Join-Path $npmCacheRoot "_cacache"
+    if (Test-Path $npmCacache) {
+        $badCache = Get-ChildItem $npmCacache -Recurse -Filter "*.json" -ErrorAction SilentlyContinue |
             Where-Object { (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '"plain-crypto-js"' }
         if ($badCache) {
-            Write-Warn "Malicious package evidence in npm cache ($npmCachePath)"
+            Write-Warn "Malicious package evidence in npm cache ($npmCacache)"
             Write-Warn "  Run: npm cache clean --force"
             foreach ($cf in $badCache) {
                 $script:FindingsCache.Add("npm cache: $($cf.FullName)")
@@ -430,7 +462,65 @@ function Scan-Network {
         }
     }
 
-    if ($networkHits -eq 0 -and $script:FindingsCache.Count -eq 0) {
+    # pnpm: honour PNPM_HOME or pnpm store path
+    $pnpmStore = $null
+    try { $pnpmStore = & pnpm store path 2>$null } catch {}
+    if (-not $pnpmStore -and $env:PNPM_HOME) { $pnpmStore = Join-Path $env:PNPM_HOME "store" }
+    if (-not $pnpmStore) { $pnpmStore = Join-Path $env:LOCALAPPDATA "pnpm-store" }
+    if (Test-Path $pnpmStore -ErrorAction SilentlyContinue) {
+        $badPnpm = Get-ChildItem $pnpmStore -Recurse -Filter "package.json" -ErrorAction SilentlyContinue |
+            Where-Object { (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '"plain-crypto-js"' }
+        if ($badPnpm) {
+            Write-Warn "Malicious package evidence in pnpm store ($pnpmStore)"
+            Write-Warn "  Run: pnpm store prune"
+            foreach ($cf in $badPnpm) {
+                $script:FindingsCache.Add("pnpm store: $($cf.FullName)")
+            }
+            if ($script:ExitCode -lt 1) { $script:ExitCode = 1 }
+        }
+    }
+
+    # yarn (v1 + v2+/berry)
+    $yarnCacheDirs = @()
+    try { $yarnClassic = & yarn cache dir 2>$null; if ($yarnClassic) { $yarnCacheDirs += $yarnClassic } } catch {}
+    $yarnBerry = Join-Path $env:LOCALAPPDATA "Yarn\Berry\cache"
+    if (Test-Path $yarnBerry) { $yarnCacheDirs += $yarnBerry }
+    foreach ($yarnDir in $yarnCacheDirs) {
+        if (Test-Path $yarnDir) {
+            $badYarn = Get-ChildItem $yarnDir -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'plain-crypto-js' }
+            if ($badYarn) {
+                Write-Warn "Malicious package evidence in yarn cache ($yarnDir)"
+                Write-Warn "  Run: yarn cache clean"
+                foreach ($cf in $badYarn) {
+                    $script:FindingsCache.Add("yarn cache: $($cf.FullName)")
+                }
+                if ($script:ExitCode -lt 1) { $script:ExitCode = 1 }
+            }
+        }
+    }
+
+    # bun
+    $bunCache = if ($env:BUN_INSTALL) { Join-Path $env:BUN_INSTALL "install\cache" } else { "$env:USERPROFILE\.bun\install\cache" }
+    if (Test-Path $bunCache -ErrorAction SilentlyContinue) {
+        $badBun = Get-ChildItem $bunCache -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'plain-crypto-js' }
+        if (-not $badBun) {
+            # also check content-addressed cache for the package name
+            $badBun = Get-ChildItem $bunCache -Recurse -Filter "package.json" -ErrorAction SilentlyContinue |
+                Where-Object { (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '"plain-crypto-js"' }
+        }
+        if ($badBun) {
+            Write-Warn "Malicious package evidence in bun cache ($bunCache)"
+            Write-Warn "  Run: bun pm cache rm"
+            foreach ($cf in $badBun) {
+                $script:FindingsCache.Add("bun cache: $($cf.FullName)")
+            }
+            if ($script:ExitCode -lt 1) { $script:ExitCode = 1 }
+        }
+    }
+
+    if ($networkHits -eq 0 -and $script:FindingsNetwork.Count -eq 0 -and $script:FindingsCache.Count -eq 0) {
         Write-Ok "No active C2 connections or cache hits detected"
     }
 }
@@ -459,6 +549,63 @@ function Output-Json {
     ConvertTo-Json $obj -Depth 5
 }
 
+# --- Exposure window diagnostics ---------------------------------------------
+function Show-ExposureCheck {
+    # Exposure window: 2026-03-31 00:21 – 03:25 UTC
+    $windowStart = [DateTime]::Parse("2026-03-31T00:21:00Z").ToUniversalTime()
+    $windowEnd   = [DateTime]::Parse("2026-03-31T03:25:00Z").ToUniversalTime()
+
+    Write-Host "  Exposure window diagnostics:" -ForegroundColor Cyan
+
+    # 1. npm install logs during the window
+    $npmLogsRoot = if ($env:npm_config_cache) { $env:npm_config_cache } else { "$env:APPDATA\npm-cache" }
+    $npmLogsDir = Join-Path $npmLogsRoot "_logs"
+    if (Test-Path $npmLogsDir) {
+        $windowLogs = Get-ChildItem $npmLogsDir -Filter "*.log" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTimeUtc -ge $windowStart -and $_.LastWriteTimeUtc -le $windowEnd }
+        if ($windowLogs) {
+            if (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "!" -ForegroundColor Yellow -NoNewline }
+            else { Write-Host "  [!]" -NoNewline }
+            Write-Host "  npm logs DURING exposure window:"
+            foreach ($log in $windowLogs) {
+                Write-Host "       $($log.Name)  $($log.LastWriteTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')) UTC" -ForegroundColor Yellow
+            }
+        } else {
+            if (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "+" -ForegroundColor Green -NoNewline }
+            else { Write-Host "  [OK]" -NoNewline }
+            Write-Host "  No npm logs found during exposure window"
+        }
+    } else {
+        Write-Host "      npm log directory not found ($npmLogsDir)" -ForegroundColor DarkGray
+    }
+
+    # 2. Lockfile last-modified timestamps
+    $lockfileNames = @("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb")
+    $lockfiles = Get-ChildItem -Path $ScanDir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $lockfileNames -contains $_.Name -and $_.FullName -notmatch '[\\/]node_modules[\\/]' }
+    if ($lockfiles) {
+        foreach ($lf in $lockfiles) {
+            $modUtc = $lf.LastWriteTimeUtc
+            $ts = $modUtc.ToString("yyyy-MM-dd HH:mm:ss")
+            $inWindow = ($modUtc -ge $windowStart -and $modUtc -le $windowEnd)
+            if ($inWindow) {
+                if (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "!" -ForegroundColor Red -NoNewline }
+                else { Write-Host "  [!]" -NoNewline }
+                Write-Host "  $($lf.FullName)" -NoNewline
+                Write-Host "  modified $ts UTC" -ForegroundColor Red -NoNewline
+                Write-Host "  <-- INSIDE exposure window" -ForegroundColor Red
+            } else {
+                if (-not $NoColor) { Write-Host "  " -NoNewline; Write-Host "+" -ForegroundColor Green -NoNewline }
+                else { Write-Host "  [OK]" -NoNewline }
+                Write-Host "  $($lf.FullName)" -NoNewline
+                Write-Host "  modified $ts UTC" -ForegroundColor DarkGray -NoNewline
+                Write-Host "  (outside window)"
+            }
+        }
+    }
+    Write-Host ""
+}
+
 # --- Summary -----------------------------------------------------------------
 function Print-Summary {
     $total = $script:FindingsPackages.Count + $script:FindingsModules.Count +
@@ -479,13 +626,15 @@ function Print-Summary {
             else { Write-Host "  RESULT: SUSPICIOUS — $total finding(s)" }
             Write-Host ""
             Write-Host "  Compromised axios version found in lockfile/cache."
-            Write-Host "  Check if npm install ran during exposure window:"
-            Write-Host "  2026-03-31  00:21 - 03:25 UTC" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "  Exposure window: 2026-03-31  00:21 - 03:25 UTC" -ForegroundColor DarkGray
+            Write-Host ""
+            Show-ExposureCheck
             Write-Host ""
             Write-Host "  Remediation:"
             Write-Host "  1. Downgrade:  npm install axios@1.14.0  (or 0.30.3 for 0.x)"
             Write-Host "  2. Remove:     Remove-Item node_modules\plain-crypto-js -Recurse"
-            Write-Host "  3. Clean:      npm cache clean --force"
+            Write-Host "  3. Clean:      npm cache clean --force  (or pnpm store prune / yarn cache clean / bun pm cache rm)"
             Write-Host "  4. Reinstall:  Remove-Item node_modules -Recurse; npm install"
             Write-Host "  5. Audit CI:   check pipeline logs from exposure window"
         }
@@ -495,6 +644,8 @@ function Print-Summary {
             Write-Host ""
             if (-not $NoColor) { Write-Host "  WAVESHAPER.V2 RAT artifacts detected. Assume full compromise." -ForegroundColor Red }
             else { Write-Host "  WAVESHAPER.V2 RAT artifacts detected. Assume full compromise." }
+            Write-Host ""
+            Show-ExposureCheck
             Write-Host ""
             Write-Host "  Immediate actions:"
             Write-Host "  1. ISOLATE this machine from the network NOW" -ForegroundColor Red

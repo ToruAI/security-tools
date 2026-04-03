@@ -34,7 +34,7 @@ On March 31, 2026, attackers hijacked the npm account of axios maintainer `jason
 | Check | bash (macOS/Linux) | PowerShell (Windows) |
 |---|:---:|:---:|
 | Compromised axios in lockfiles | ✓ | ✓ |
-| package-lock.json / yarn.lock / pnpm-lock.yaml | ✓ | ✓ |
+| package-lock.json / yarn.lock / pnpm-lock.yaml / bun.lock | ✓ | ✓ |
 | plain-crypto-js in node_modules | ✓ | ✓ |
 | Dropper already executed (self-deleted setup.js) | ✓ | ✓ |
 | Secondary compromised packages | ✓ | ✓ |
@@ -47,6 +47,8 @@ On March 31, 2026, attackers hijacked the npm account of axios maintainer `jason
 | Scheduled tasks (post-exploitation) | — | ✓ |
 | PowerShell history scan | — | ✓ |
 | macOS LaunchAgent persistence | ✓ | — |
+| Exposure window diagnostics (npm logs + lockfile timestamps) | ✓ | ✓ |
+| bun cache hits | — | ✓ |
 | JSON output (CI-friendly) | ✓ | ✓ |
 
 ---
@@ -90,7 +92,7 @@ powershell -ExecutionPolicy Bypass -File axios-scan.ps1
 | Code | Meaning |
 |---|---|
 | `0` | Clean — nothing found |
-| `1` | Suspicious — compromised version in lockfile or cache |
+| `1` | Suspicious — compromised version in lockfile or cache (shows exposure window diagnostics) |
 | `2` | Compromised — RAT artifacts or active C2 connection detected |
 
 ### CI/CD integration
