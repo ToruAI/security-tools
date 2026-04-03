@@ -616,6 +616,78 @@ output_json() {
   echo "}"
 }
 
+# --- Exposure window diagnostics ---------------------------------------------
+# Exposure window: 2026-03-31 00:21:00 – 03:25:00 UTC
+WINDOW_START=1774916460
+WINDOW_END=1774927500
+
+get_mtime_epoch() {
+  local file="$1"
+  if [ "$PLATFORM" = "macos" ]; then
+    stat -f '%m' "$file" 2>/dev/null
+  else
+    stat -c '%Y' "$file" 2>/dev/null
+  fi
+}
+
+epoch_to_human() {
+  local epoch="$1"
+  if [ "$PLATFORM" = "macos" ]; then
+    date -r "$epoch" "+%Y-%m-%d %H:%M:%S" 2>/dev/null
+  else
+    date -d "@$epoch" "+%Y-%m-%d %H:%M:%S" 2>/dev/null
+  fi
+}
+
+show_exposure_check() {
+  _out ""
+  _out "${BOLD}  Exposure window diagnostics:${RESET}"
+  _out "  ${DIM}2026-03-31  00:21 – 03:25 UTC${RESET}"
+
+  # --- npm logs during the window ---
+  local npm_log_dir
+  npm_log_dir="$(npm config get cache 2>/dev/null)/_logs"
+  if [ -d "$npm_log_dir" ]; then
+    local found_window_logs=false
+    while IFS= read -r logfile; do
+      [ -z "$logfile" ] && continue
+      local mtime
+      mtime=$(get_mtime_epoch "$logfile")
+      if [ -n "$mtime" ] && [ "$mtime" -ge "$WINDOW_START" ] && [ "$mtime" -le "$WINDOW_END" ]; then
+        found_window_logs=true
+        local ts
+        ts=$(epoch_to_human "$mtime")
+        warn "npm log during exposure window: $(basename "$logfile")"
+        _out "       ${YELLOW}$ts UTC — $logfile${RESET}"
+      fi
+    done < <(find "$npm_log_dir" -name "*.log" 2>/dev/null)
+    $found_window_logs || ok "No npm logs found during exposure window"
+  else
+    info "npm log directory not found (no install history)"
+  fi
+
+  # --- Lockfile timestamps ---
+  local lockfiles
+  lockfiles=$(find "$SCAN_DIR" \
+    \( -name "node_modules" -o -name ".git" \) -prune \
+    -o \( -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" \) -print \
+    2>/dev/null)
+
+  while IFS= read -r lf; do
+    [ -z "$lf" ] && continue
+    local mtime ts
+    mtime=$(get_mtime_epoch "$lf")
+    [ -z "$mtime" ] && continue
+    ts=$(epoch_to_human "$mtime")
+    if [ "$mtime" -ge "$WINDOW_START" ] && [ "$mtime" -le "$WINDOW_END" ]; then
+      danger "LOCKFILE modified during exposure window: $lf"
+      _out "       ${RED}Modified: $ts UTC  ← npm install may have run during attack${RESET}"
+    else
+      $VERBOSE && info "$lf  modified $ts (outside window)"
+    fi
+  done <<< "$lockfiles"
+}
+
 # --- Summary -----------------------------------------------------------------
 print_summary() {
   local total_findings=$(( \
@@ -638,8 +710,7 @@ print_summary() {
       echo -e "${BOLD}${YELLOW}  RESULT: SUSPICIOUS — $total_findings finding(s)${RESET}"
       echo ""
       echo -e "${YELLOW}  Compromised axios version found in lockfile/cache.${RESET}"
-      echo -e "  Check if npm install ran during the exposure window:"
-      echo -e "  ${DIM}2026-03-31  00:21 – 03:25 UTC${RESET}"
+      show_exposure_check
       echo ""
       echo -e "  Remediation:"
       echo -e "  1. Downgrade:  npm install axios@1.14.0  (or 0.30.3 for 0.x)"
@@ -653,6 +724,7 @@ print_summary() {
       echo ""
       echo -e "${RED}  WAVESHAPER.V2 RAT artifacts or active C2 communication detected."
       echo -e "  Assume full system compromise. All credentials exposed.${RESET}"
+      show_exposure_check
       echo ""
       echo -e "  ${BOLD}Immediate actions:${RESET}"
       echo -e "  1. ${RED}ISOLATE${RESET} this machine from the network NOW"
